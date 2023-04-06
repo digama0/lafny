@@ -489,8 +489,23 @@ def withMatch
     updates := updates.union (removeUpdates vars res.updates)
   pure { code, exits, updates }
 
-def withDoElem : TSyntax `doElem → Continuation → M CodeBlock :=
-  sorry -- TODO: implemented_by withDoElemImpl
+initialize withDoElemRef : IO.Ref (TSyntax `doElem → Continuation → M CodeBlock) ←
+  IO.mkRef fun _ _ => throwError "undefined"
+
+partial def withDoElem (doElem : TSyntax `doElem) (tail : Continuation) : M CodeBlock :=
+  withIncRecDepth <| withRef doElem do
+    checkMaxHeartbeats "`do`-expander"
+    if let some doElem ← liftMacroM <| expandMacro? doElem then
+      return (← withDoElem doElem tail)
+    if hasLiftMethod doElem then
+      let (doElem, doElemsNewRev) ← (expandLiftMethodAux false false doElem).run []
+      let mut ref := .missing
+      let mut k := withDoElem doElem tail
+      for elem in doElemsNewRev do
+        k := withDoElem elem (.then ref k)
+        ref := elem
+      return ← k
+    (← withDoElemRef.get) doElem tail
 
 def withDoSeq (doSeq : TSyntax ``doSeq) (x : Continuation) : Continuation :=
   if doSeq.raw.getKind == ``Parser.Term.doSeqBracketed then
@@ -688,102 +703,92 @@ def withDoTry (tryTk : Syntax)
   else
     body tail
 
-def withDoElem' (doElem : TSyntax `doElem) (tail : Continuation) : M CodeBlock :=
-  withIncRecDepth <| withRef doElem do
-    checkMaxHeartbeats "`do`-expander"
-    if let some doElem ← liftMacroM <| expandMacro? doElem then
-      return (← withDoElem doElem tail)
-    if hasLiftMethod doElem then
-      let (doElem, doElemsNewRev) ← (expandLiftMethodAux false false doElem).run []
-      let mut ref := .missing
-      let mut k := withDoElem doElem tail
-      for elem in doElemsNewRev do
-        k := withDoElem elem (.then ref k)
-        ref := elem
-      return ← k
-    match doElem with
-    | `(doElem| let $[mut%$tk]? $decl:letDecl) =>
-      let vars ← getLetDeclVars decl
-      withSyntaxBinder vars (fun rhs => `(let $decl:letDecl; ?$rhs)) <|
-        (withNewMutableVars vars tk.isSome tail).run
-    | `(doElem| have $decl:haveDecl) =>
-      let vars ← getHaveDeclVars decl
-      withSyntaxBinder vars (fun rhs => `(have $decl:haveDecl; ?$rhs)) tail.run
-    | `(doElem| let rec $decl:letRecDecls) =>
-      let vars ← getLetRecDeclsVars decl
-      withSyntaxBinder vars (fun rhs => `(let rec $decl:letRecDecls; ?$rhs)) tail.run
-    | `(doElem| $x:ident $[: $ty]? := $rhs) => do
-      let lctx ← getLCtx
-      withDoElem (← `(doElem| let $x:ident $[: $ty]? :=
-        ensure_type_of% $x $(quote "invalid reassignment, value") $rhs)) <| .then .missing <|
-      withReassign #[x] lctx tail
-    | `(doElem| $pat:term $[: $ty]? := $rhs) =>
-      let vars ← getPatternVarsEx pat
-      let lctx ← getLCtx
-      withDoElem (← `(doElem| let $pat:term $[: $ty]? :=
-        ensure_type_of% $pat $(quote "invalid reassignment, value") $rhs)) <| .then .missing <|
-      withReassign vars lctx tail
-    | `(doElem| let $[mut%$tk]? $x:ident $[: $ty]? ← $rhs) =>
-      checkLetArrowRHS rhs
-      let ty ← elabType (← if let some ty := ty then pure ty else `(_))
-      let ctx ← read
-      withReader (fun _ => { ctx with expectedType := ty }) <|
-        withDoElem rhs <| .bind .missing (.ident x ty) <|
-          (withNewMutableVars #[x] tk.isSome tail).run ctx
-    | `(doElem| let $[mut%$tk]? $pat:term ← $rhs) =>
-      checkLetArrowRHS rhs
-      let vars ← getPatternVarsEx pat
-      let ty ← mkFreshTypeMVar
-      let ctx ← read
-      withReader (fun _ => { ctx with expectedType := ty }) <|
-        withDoElem rhs <| .bind .missing (.term pat) <|
-          (withNewMutableVars vars tk.isSome tail).run ctx
-    | `(doElem| let $[mut%$tk]? $pat:term ← $rhs | $els) =>
-      checkLetArrowRHS rhs
-      let a ← mkFreshIdent rhs
-      withDoElem (← `(doElem| let $a ← $rhs)) <| .then .missing do
-        withDoElem (← `(doElem| let $[mut%$tk]? $pat := $a | $els)) tail
-    | `(doElem| let $[mut%$tk]? $pat:term := $rhs | $els) => sorry
-    | `(doElem| $x:ident $[: $ty]? ← $rhs) => do
-      let lctx ← getLCtx
-      let m := (← read).mStx
-      withDoElem (← `(doElem| let $x:ident $[: $ty]? ←
-        (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $x)))) <|
-      .then .missing <| withReassign #[x] lctx tail
-    | `(doElem| $pat:term ← $rhs) => do
-      let vars ← getPatternVarsEx pat
-      let lctx ← getLCtx
-      let m := (← read).mStx
-      withDoElem (← `(doElem| let $pat:term ←
-        (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $pat)))) <|
-      .then .missing <| withReassign vars lctx tail
-    | `(doElem| $pat:term ← $rhs | $els) => sorry
-    | `(doElem| if%$i $cond:doIfCond then $t
-        $[else if%$is $conds:doIfCond then $ts]* $[else $e?]?) =>
-      tail.withJP <| withIfChain i cond t (is.zip $ conds.zip ts).toList e?
-    | `(doElem| unless%$i $cond:term do $t) =>
-      tail.withJP fun tail => withIf i cond tail.run (runDoSeq t tail)
-    | `(doElem| for $[$[$h :]? $x in $xs],* do $t) =>
-      tail.withJP <| withDoParallelFor id (h.zip $ x.zip xs).reverse.toList t
-    | `(doElem| match $[$gen]? $[$motive]? $discr,* with $[| $[$patsss,*]|* => $val]*) =>
-      tail.withJP fun tail => withMatch gen motive discr patsss (val.map (runDoSeq · tail))
-    | `(doElem| break) =>
-      doExit (.break none) (← mkConstWithFreshMVarLevels ``PUnit.unit) tail
-    | `(doElem| continue) =>
-      doExit (.continue none) (← mkConstWithFreshMVarLevels ``PUnit.unit) tail
-    | `(doElem| return $(e)?) => doReturn e tail
-    | `(doElem| dbg_trace $msg) =>
-      withSyntaxBinder #[] (fun rhs => `(dbg_trace $msg; ?$rhs)) tail.run
-    | `(doElem| assert! $msg) =>
-      withSyntaxBinder #[] (fun rhs => `(assert! $msg; ?$rhs)) tail.run
-    | `(doElem| do $elems) => runDoSeq elems tail
-    | `(doElem| $e:term) => withDoExpr e tail |>.run
-    | _ =>
-      let doElem := doElem.raw
-      if doElem.getKind == ``Parser.Term.doTry then
-        -- the way try is defined makes it impossible to match against
-        withDoTry doElem[0] doElem[1] doElem[2].getArgs doElem[3].getOptional? tail
-      else throwError "unexpected do-element of kind {doElem.getKind}:\n{doElem}"
+def withDoElemCore (doElem : TSyntax `doElem) (tail : Continuation) : M CodeBlock := do
+  match doElem with
+  | `(doElem| let $[mut%$tk]? $decl:letDecl) =>
+    let vars ← getLetDeclVars decl
+    withSyntaxBinder vars (fun rhs => `(let $decl:letDecl; ?$rhs)) <|
+      (withNewMutableVars vars tk.isSome tail).run
+  | `(doElem| have $decl:haveDecl) =>
+    let vars ← getHaveDeclVars decl
+    withSyntaxBinder vars (fun rhs => `(have $decl:haveDecl; ?$rhs)) tail.run
+  | `(doElem| let rec $decl:letRecDecls) =>
+    let vars ← getLetRecDeclsVars decl
+    withSyntaxBinder vars (fun rhs => `(let rec $decl:letRecDecls; ?$rhs)) tail.run
+  | `(doElem| $x:ident $[: $ty]? := $rhs) => do
+    let lctx ← getLCtx
+    withDoElem (← `(doElem| let $x:ident $[: $ty]? :=
+      ensure_type_of% $x $(quote "invalid reassignment, value") $rhs)) <| .then .missing <|
+    withReassign #[x] lctx tail
+  | `(doElem| $pat:term $[: $ty]? := $rhs) =>
+    let vars ← getPatternVarsEx pat
+    let lctx ← getLCtx
+    withDoElem (← `(doElem| let $pat:term $[: $ty]? :=
+      ensure_type_of% $pat $(quote "invalid reassignment, value") $rhs)) <| .then .missing <|
+    withReassign vars lctx tail
+  | `(doElem| let $[mut%$tk]? $x:ident $[: $ty]? ← $rhs) =>
+    checkLetArrowRHS rhs
+    let ty ← elabType (← if let some ty := ty then pure ty else `(_))
+    let ctx ← read
+    withReader (fun _ => { ctx with expectedType := ty }) <|
+      withDoElem rhs <| .bind .missing (.ident x ty) <|
+        (withNewMutableVars #[x] tk.isSome tail).run ctx
+  | `(doElem| let $[mut%$tk]? $pat:term ← $rhs) =>
+    checkLetArrowRHS rhs
+    let vars ← getPatternVarsEx pat
+    let ty ← mkFreshTypeMVar
+    let ctx ← read
+    withReader (fun _ => { ctx with expectedType := ty }) <|
+      withDoElem rhs <| .bind .missing (.term pat) <|
+        (withNewMutableVars vars tk.isSome tail).run ctx
+  | `(doElem| let $[mut%$tk]? $pat:term ← $rhs | $els) =>
+    checkLetArrowRHS rhs
+    let a ← mkFreshIdent rhs
+    withDoElem (← `(doElem| let $a ← $rhs)) <| .then .missing do
+      withDoElem (← `(doElem| let $[mut%$tk]? $pat := $a | $els)) tail
+  | `(doElem| let $[mut%$tk]? $pat:term := $rhs | $els) => panic! "unimplemented"
+  | `(doElem| $x:ident $[: $ty]? ← $rhs) => do
+    let lctx ← getLCtx
+    let m := (← read).mStx
+    withDoElem (← `(doElem| let $x:ident $[: $ty]? ←
+      (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $x)))) <|
+    .then .missing <| withReassign #[x] lctx tail
+  | `(doElem| $pat:term ← $rhs) => do
+    let vars ← getPatternVarsEx pat
+    let lctx ← getLCtx
+    let m := (← read).mStx
+    withDoElem (← `(doElem| let $pat:term ←
+      (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $pat)))) <|
+    .then .missing <| withReassign vars lctx tail
+  | `(doElem| $pat:term ← $rhs | $els) => panic! "unimplemented"
+  | `(doElem| if%$i $cond:doIfCond then $t
+      $[else if%$is $conds:doIfCond then $ts]* $[else $e?]?) =>
+    tail.withJP <| withIfChain i cond t (is.zip $ conds.zip ts).toList e?
+  | `(doElem| unless%$i $cond:term do $t) =>
+    tail.withJP fun tail => withIf i cond tail.run (runDoSeq t tail)
+  | `(doElem| for $[$[$h :]? $x in $xs],* do $t) =>
+    tail.withJP <| withDoParallelFor id (h.zip $ x.zip xs).reverse.toList t
+  | `(doElem| match $[$gen]? $[$motive]? $discr,* with $[| $[$patsss,*]|* => $val]*) =>
+    tail.withJP fun tail => withMatch gen motive discr patsss (val.map (runDoSeq · tail))
+  | `(doElem| break) =>
+    doExit (.break none) (← mkConstWithFreshMVarLevels ``PUnit.unit) tail
+  | `(doElem| continue) =>
+    doExit (.continue none) (← mkConstWithFreshMVarLevels ``PUnit.unit) tail
+  | `(doElem| return $(e)?) => doReturn e tail
+  | `(doElem| dbg_trace $msg) =>
+    withSyntaxBinder #[] (fun rhs => `(dbg_trace $msg; ?$rhs)) tail.run
+  | `(doElem| assert! $msg) =>
+    withSyntaxBinder #[] (fun rhs => `(assert! $msg; ?$rhs)) tail.run
+  | `(doElem| do $elems) => runDoSeq elems tail
+  | `(doElem| $e:term) => withDoExpr e tail |>.run
+  | _ =>
+    let doElem := doElem.raw
+    if doElem.getKind == ``Parser.Term.doTry then
+      -- the way try is defined makes it impossible to match against
+      withDoTry doElem[0] doElem[1] doElem[2].getArgs doElem[3].getOptional? tail
+    else throwError "unexpected do-element of kind {doElem.getKind}:\n{doElem}"
+
+initialize withDoElemRef.set withDoElemCore
 
 elab "do'" seq:doSeq : term <= expectedType => do
   let { m, returnType, .. } ← extractBind expectedType
