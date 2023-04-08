@@ -80,15 +80,14 @@ private partial def hasLiftMethod : Syntax → Bool
 
 structure ExtractMonadResult where
   m            : Expr
-  returnType   : Expr
   expectedType : Expr
 
 private def mkUnknownMonadResult : MetaM ExtractMonadResult := do
   let u ← mkFreshLevelMVar
   let v ← mkFreshLevelMVar
   let m ← mkFreshExprMVar (← mkArrow (mkSort (mkLevelSucc u)) (mkSort (mkLevelSucc v)))
-  let returnType ← mkFreshExprMVar (mkSort (mkLevelSucc u))
-  return { m, returnType, expectedType := mkApp m returnType }
+  let expectedType ← mkFreshExprMVar (mkSort (mkLevelSucc u))
+  return { m, expectedType }
 
 private partial def extractBind (expectedType? : Option Expr) : TermElabM ExtractMonadResult := do
   let some expectedType := expectedType? | mkUnknownMonadResult
@@ -97,7 +96,7 @@ private partial def extractBind (expectedType? : Option Expr) : TermElabM Extrac
     try
       let bindInstType ← mkAppM ``Bind #[m]
       discard <| Meta.synthInstance bindInstType
-      return some { m, returnType, expectedType }
+      return some { m, expectedType := returnType }
     catch _ =>
       return none
   let rec extract? (type : Expr) : MetaM (Option ExtractMonadResult) := do
@@ -116,8 +115,6 @@ private partial def extractBind (expectedType? : Option Expr) : TermElabM Extrac
   match (← extract? expectedType) with
   | some r => return r
   | none   => throwError "invalid `do` notation, expected type is not a monad application{indentExpr expectedType}\nYou can use the `do` notation in pure code by writing `Id.run do` instead of `do`, where `Id` is the identity monad."
-
-namespace Do
 
 local instance : Ord Name := ⟨Name.cmp⟩
 deriving instance Ord for Option
@@ -228,6 +225,9 @@ structure Context where
   muts        : NameMap FVarId := {}
   exits       : RBMap Exit ExitPoint compare := {}
 
+def Context.returnType' (ctx : Context) : Expr := mkApp ctx.m ctx.returnType
+def Context.expectedType' (ctx : Context) : Expr := mkApp ctx.m ctx.expectedType
+
 abbrev M := ReaderT Context TermElabM
 
 private partial def expandLiftMethodAux (inQuot : Bool) (inBinder : Bool) : Syntax → StateT (List (TSyntax `doElem)) M (TSyntax `doElem)
@@ -258,8 +258,8 @@ def expandLiftMethod (doElem : TSyntax `doElem) : M (List (TSyntax `doElem) × T
     let (doElem, doElemsNewRev) ← (expandLiftMethodAux false false doElem).run []
     return (doElemsNewRev, doElem)
 
-def checkLetArrowRHS (doElem : Syntax) : M Unit := do
-  let kind := doElem.getKind
+def checkLetArrowRHS (doElem : TSyntax `doElem) : M Unit := do
+  let kind := doElem.raw.getKind
   if kind == ``Parser.Term.doLetArrow ||
      kind == ``Parser.Term.doLet ||
      kind == ``Parser.Term.doLetRec ||
@@ -270,19 +270,26 @@ def checkLetArrowRHS (doElem : Syntax) : M Unit := do
 
 inductive Binder where
   | ident (x : Ident) (ty : Expr)
-  | term (e : Term)
+  | term (e : Term) (ty : Expr)
 
 inductive Continuation where
-  | then (ref : Syntax) (k : M CodeBlock)
-  | bind (ref : Syntax) (bi : Binder) (k : M CodeBlock)
-  | discard (ref : Syntax) (ty : Expr) (k : NameMap FVarId → TermElabM Expr)
-  | pure (ref : Syntax) (ty : Expr) (k : Expr → NameMap FVarId → TermElabM Expr)
-  | id (ty : Expr)
+  | protected then (ref : Syntax) (k : M CodeBlock)
+  | protected bind (ref : Syntax) (bi : Binder) (k : M CodeBlock)
+  | protected discard (ref : Syntax) (ty : Expr) (k : NameMap FVarId → TermElabM Expr)
+  | protected pure (ref : Syntax) (ty : Expr) (k : Expr → NameMap FVarId → TermElabM Expr)
+  | protected id (ty : Expr)
+  | protected withLCtx' (lctx : LocalContext) (localInsts : LocalInstances) (k : Continuation)
+
+protected def Continuation.withLCtx (lctx : LocalContext) (localInsts : LocalInstances) :
+    Continuation → Continuation
+  | k@(.id _) | k@(.withLCtx' ..) => k
+  | k => .withLCtx' lctx localInsts k
 
 def jumpToJP [Pure m] (ctx : Context) (tgt ret : Expr) (vars' : NameMap FVarId) : m Expr :=
   pure <| mkApp tgt ret |> ctx.muts.fold fun e n _ => mkApp e <| .fvar <| vars'.find! n
 
 def Continuation.markUnreachable : Continuation → TermElabM Unit
+  | .withLCtx' _ _ k => k.markUnreachable
   | .id _ => return
   | .then ref _ | .bind ref .. | .discard ref .. | .pure ref .. =>
     unless ref.isMissing do
@@ -293,33 +300,49 @@ def removeUpdates (vars : Array Ident) (updates : NameSet) : NameSet :=
 
 def withSyntaxBinder (vars : Array Ident) (stx : Ident → TermElabM Syntax) (k : M CodeBlock) : M CodeBlock := do
   let name ← mkFreshUserName `rhs
-  let m := (← mkFreshExprMVar none .syntheticOpaque name).mvarId!
-  let code ← elabTerm (← stx (mkIdent name)) (← read).returnType
-  let res ← m.withContext k
-  m.assign res.code
-  pure { res with code, updates := removeUpdates vars res.updates }
+  let ty := mkApp (← read).m (← read).returnType
+  let code ← elabTerm (← stx (mkIdent name)) none
+  let m := ((← getMCtx).findUserName? name).get!
+  m.withContext do
+    unless ← isDefEq (← m.getType) ty do throwError "type mismatch"
+    let res ← k
+    m.assign (← ensureHasType ty res.code)
+    pure { res with code, updates := removeUpdates vars res.updates }
 
 def Continuation.run (k : Continuation) : M CodeBlock := fun ctx => do
   match k with
+  | .withLCtx' lctx insts k => withLCtx lctx insts (k.run ctx)
   | .then _ k => k ctx
   | .bind _ (.ident x ty) k =>
+    let u ← mkFreshLevelMVar
+    unless ← isDefEq ty (.const ``PUnit [u]) do
+      throwTypeMismatchError none ty (.const ``PUnit [u]) (.const ``PUnit.unit [u])
     withLocalDeclD x.getId ty fun val => do
       let res ← k ctx
-      let code := res.code.replaceFVar val (← mkConstWithFreshMVarLevels ``PUnit.unit)
+      let code := res.code.replaceFVar val (.const ``PUnit.unit [u])
       return { res with code, updates := res.updates.erase x.getId }
-  | .bind _ (.term pat) k => do
-    withSyntaxBinder (← getPatternVarsEx pat) (fun rhs => `(let $pat := (); ?$rhs)) k ctx
+  | .bind _ (.term pat ty) k => do
+    let ty ← exprToSyntax ty
+    withSyntaxBinder (← getPatternVarsEx pat) (fun rhs => `(let $pat : $ty := (); ?$rhs)) k ctx
   | .discard _ _ k => return { code := ← k ctx.muts }
-  | .pure _ _ k => return { code := ← k (← mkConstWithFreshMVarLevels ``PUnit.unit) ctx.muts }
-  | .id _ => return { code := ← mkConstWithFreshMVarLevels ``PUnit.unit }
+  | .pure _ ty k =>
+    let u ← mkFreshLevelMVar
+    unless ← isDefEq ty (.const ``PUnit [u]) do
+      throwTypeMismatchError none ty (.const ``PUnit [u]) (.const ``PUnit.unit [u])
+    return { code := ← k (.const ``PUnit.unit [u]) ctx.muts }
+  | .id _ =>
+    let star ← mkConstWithFreshMVarLevels ``PUnit.unit
+    return { code := ← mkAppOptM ``Pure.pure #[ctx.m, none, none, star] }
 
 def Continuation.getType : Continuation → M Expr
+  | .withLCtx' lctx insts k => withLCtx lctx insts k.getType
   | .then .. => mkConstWithFreshMVarLevels ``PUnit
-  | .bind _ (.ident _ ty) _ | .discard _ ty _ | .pure _ ty _ | .id ty => return ty
-  | .bind _ (.term _) _ => mkFreshExprMVar none
+  | .discard _ ty _ | .pure _ ty _ | .id ty
+  | .bind _ (.ident _ ty) _ | .bind _ (.term _ ty) _ => return ty
 
 def Continuation.toFun (k : Continuation) : M CodeBlock := fun ctx => do
   match k with
+  | .withLCtx' lctx insts k => withLCtx lctx insts (k.toFun ctx)
   | .then _ k =>
     let α ← mkConstWithFreshMVarLevels ``PUnit
     let res ← k ctx
@@ -327,15 +350,14 @@ def Continuation.toFun (k : Continuation) : M CodeBlock := fun ctx => do
   | .bind _ (.ident x ty) k =>
     let mty ← exprToSyntax ty
     withSyntaxBinder #[x] (fun rhs => `(fun $x : $mty => ?$rhs)) k ctx
-  | .bind _ (.term pat) k =>
-    withSyntaxBinder (← getPatternVarsEx pat) (fun rhs => `(fun $pat => ?$rhs)) k ctx
+  | .bind _ (.term pat ty) k =>
+    let ty ← exprToSyntax ty
+    withSyntaxBinder (← getPatternVarsEx pat) (fun rhs => `(fun $pat : $ty => ?$rhs)) k ctx
   | .discard _ ty k => return { code := mkLambda `_ .default ty (← k ctx.muts) }
   | .pure _ ty k =>
     withLocalDeclD (← mkFreshBinderName) ty fun x => do
       return { code := ← mkLambdaFVars #[x] <| ← k x ctx.muts }
-  | .id ty => do
-    let x ← mkFreshBinderName
-    return { code := .lam x ty (.bvar 0) .default }
+  | .id ty => return { code := ← mkAppOptM ``Pure.pure #[ctx.m, none, ty] }
 
 def Continuation.apply (lhs : CodeBlock) (k : Continuation) : M CodeBlock := fun ctx => do
   if let .id _ := k then
@@ -349,7 +371,7 @@ def Continuation.apply (lhs : CodeBlock) (k : Continuation) : M CodeBlock := fun
 
 def withDoExpr (val : Syntax) (k : Continuation) : M CodeBlock := fun ctx => do
   let α ← k.getType ctx
-  k.apply { code := ← elabTerm val (mkApp ctx.m α) } ctx
+  k.apply { code := ← elabTermEnsuringType val (mkApp ctx.m α) } ctx
 
 def addVars (newVars : Array Ident) (muts : NameMap FVarId) : TermElabM (NameMap FVarId) :=
   newVars.foldlM (init := muts) fun muts var => do
@@ -357,6 +379,7 @@ def addVars (newVars : Array Ident) (muts : NameMap FVarId) : TermElabM (NameMap
 
 def Continuation.map (f : ∀ {α}, (NameMap FVarId → TermElabM α) → (NameMap FVarId → TermElabM α)) :
     Continuation → Continuation
+  | .withLCtx' lctx insts k => .withLCtx lctx insts (k.map f)
   | .then ref k => .then ref <| fun ctx => do f (fun muts => k { ctx with muts }) ctx.muts
   | .bind ref bi k => .bind ref bi <| fun ctx => do f (fun muts => k { ctx with muts }) ctx.muts
   | .discard ref ty k => .discard ref ty <| f k
@@ -394,12 +417,12 @@ def withNewJP (ty : Expr) (k : Expr → Expr → M (CodeBlock × α)) :
   let jpName ← mkFreshUserName `__do_jp
   let jpBodyType ← mkFreshTypeMVar
   let fvars := ctx.muts.fold (fun fvars _ fvarId => fvars.push (.fvar fvarId)) #[]
-  let mvarType ← mkArrow ty (← mkForallFVars fvars ctx.returnType)
+  let mvarType ← mkArrow ty (← mkForallFVars fvars ctx.returnType')
   withLocalDeclD jpName (← mkArrow ty jpBodyType) fun jp => do
     let mvar ← mkFreshExprMVar mvarType .syntheticOpaque
     let (res, a) ← k mvar jpBodyType
     let fvars' := res.updates.toArray.map (.fvar <| ctx.muts.find! ·)
-    jpBodyType.mvarId!.assign <| ← mkForallFVars fvars' ctx.returnType
+    jpBodyType.mvarId!.assign <| ← mkForallFVars fvars' ctx.returnType'
     withLocalDeclD (← mkFreshUserName `ret) ty fun ret => do
       mvar.mvarId!.assign <| ← mkLambdaFVars (#[ret] ++ fvars) <| mkAppN (mkApp jp ret) fvars'
     pure ({ res with code := ← mkLambdaFVars #[jp] res.code }, fvars', a)
@@ -407,34 +430,32 @@ def withNewJP (ty : Expr) (k : Expr → Expr → M (CodeBlock × α)) :
 def Continuation.withJP (K : Continuation → M CodeBlock) (k : Continuation) : M CodeBlock :=
   match k with
   | .discard .. | .pure .. | .id _ => K k
+  | .withLCtx' lctx insts k => k.withJP fun k' => K (.withLCtx lctx insts k')
   | _ => do
     let ctx ← read
     let (res, fvars', jpBodyType) ← withNewJP ctx.expectedType fun mvar jpBodyType => do
       let res ← K <| .pure .missing ctx.expectedType (jumpToJP ctx mvar)
-      Pure.pure (res, jpBodyType)
+      pure (res, jpBodyType)
     let res' ← match k with
-    | .discard .. | .pure .. | .id _ => unreachable!
+    | .discard .. | .pure .. | .id _ | .withLCtx' .. => unreachable!
     | .bind _ (Binder.ident xStx ty) k =>
       withLocalDeclD xStx.getId ty fun x => do
         addLocalVarInfo xStx x
         let res' ← k
         let code' ← mkLambdaFVars (#[x] ++ fvars') res'.code
-        Pure.pure { res' with code := code', updates := res'.updates.erase xStx.getId }
-    | .bind _ (Binder.term pat) k =>
+        pure { res' with code := code', updates := res'.updates.erase xStx.getId }
+    | .bind _ (Binder.term pat ty) k =>
       let vars ← getPatternVarsEx pat
       let name ← mkFreshUserName `rhs
       let m ← mkFreshExprMVar none .syntheticOpaque name
-      let code ← elabTerm
-        (← `(fun $pat:term => ?$(mkIdent name)))
-        (← mkArrow ctx.expectedType jpBodyType)
+      let code ← elabTerm (← `(fun $pat:term => ?$(mkIdent name))) (← mkArrow ty jpBodyType)
       let res' ← m.mvarId!.withContext k
       m.mvarId!.assign (← mkLambdaFVars fvars' res'.code)
-      Pure.pure { res' with code, updates := removeUpdates vars res'.updates }
+      pure { res' with code, updates := removeUpdates vars res'.updates }
     | .then _ k =>
       let res' ← k
-      let code' ← mkLambdaFVars fvars' res'.code
-      Pure.pure { res' with code := mkForall `x .default ctx.expectedType code' }
-    Pure.pure {
+      pure { res' with code := ← mkLambdaFVars fvars' res'.code }
+    pure {
       code := mkLetFunAnnotation <| mkApp res.code res'.code
       updates := res.updates.union res'.updates
       exits := res.exits.union res'.exits
@@ -479,7 +500,7 @@ def withMatch
     varss := varss.push <| (m, ← getPatternsVarsEx vars)
     stxs := stxs.push <| ← `(?$(mkIdent name))
   let stx ← `(match $[$gen]? $[$motive]? $discr,* with $[| $[$patsss,*]|* => $stxs]*)
-  let code ← elabTerm stx (← read).returnType
+  let code ← elabTerm stx (← read).returnType'
   let mut updates : NameSet := {}
   let mut exits : RBTree Exit compare := {}
   for (m, vars) in varss, k in ks do
@@ -533,7 +554,7 @@ def withIf (ifTk : Syntax) (cond : TSyntax ``doIfCond) (k₁ k₂ : M CodeBlock)
       `(if $h : $cond then ?$(mkIdent n₁) else ?$(mkIdent n₂))
     else
       `(if $cond then ?$(mkIdent n₁) else ?$(mkIdent n₂))
-    let code ← elabTerm stx (← read).returnType
+    let code ← elabTerm stx (← read).returnType'
     let res₁ ← m₁.withContext k₁; m₁.assign res₁.code
     let res₂ ← m₂.withContext k₂; m₂.assign res₂.code
     pure {
@@ -623,7 +644,7 @@ def withDoTryCatch
   let m := (← mkFreshExprMVar none .syntheticOpaque name).mvarId!
   let εName ← mkFreshUserName `ε
   let ε ← mkFreshTypeMVar (userName := εName)
-  let funTy ← mkArrow ε α
+  let funTy ← mkArrow ε (mkApp (← read).m α)
   let (knownTy, code, handler) ← match catch_ with
   | `(doCatch| catch $x $[: $ty]? => $handler) =>
     if let some ty := ty then
@@ -660,7 +681,7 @@ def withDoTryFinally
   let mut mvars := #[]
   let ctx ← read
   let fvars := ctx.muts.fold (fun fvars _ fvarId => fvars.push (.fvar fvarId)) #[]
-  let contTy ← mkForallFVars fvars ctx.returnType
+  let contTy ← mkForallFVars fvars ctx.returnType'
   for (exit, k) in ctx.exits do
     let mvarType ← mkArrow k.ty contTy
     let mvar ← mkFreshExprMVar mvarType .syntheticOpaque
@@ -673,7 +694,7 @@ def withDoTryFinally
   let (res', fvars', _) ← withNewJP finalizerRetTy fun mvar _ => do
     let res' ← runDoSeq fin <| .pure .missing unit (jumpToJP ctx mvar)
     pure (res', ())
-  let jpBodyType ← mkForallFVars fvars' ctx.returnType
+  let jpBodyType ← mkForallFVars fvars' ctx.returnType'
   let handlerTy ← mkArrow finalizerRetTy jpBodyType
   withLocalDeclD (← mkFreshUserName `handler) handlerTy fun handlerJP => do
     for (exit, k) in ctx.exits, mvar in mvars do
@@ -731,36 +752,40 @@ def withDoElemCore (doElem : TSyntax `doElem) (tail : Continuation) : M CodeBloc
     let ty ← elabType (← if let some ty := ty then pure ty else `(_))
     let ctx ← read
     withReader (fun _ => { ctx with expectedType := ty }) <|
-      withDoElem rhs <| .bind .missing (.ident x ty) <|
-        (withNewMutableVars #[x] tk.isSome tail).run ctx
+      withDoElem rhs <| .withLCtx (← getLCtx) (← getLocalInstances) <|
+        .bind .missing (.ident x ty) <| (withNewMutableVars #[x] tk.isSome tail).run ctx
   | `(doElem| let $[mut%$tk]? $pat:term ← $rhs) =>
     checkLetArrowRHS rhs
     let vars ← getPatternVarsEx pat
     let ty ← mkFreshTypeMVar
     let ctx ← read
     withReader (fun _ => { ctx with expectedType := ty }) <|
-      withDoElem rhs <| .bind .missing (.term pat) <|
-        (withNewMutableVars vars tk.isSome tail).run ctx
+      withDoElem rhs <| .withLCtx (← getLCtx) (← getLocalInstances) <|
+        .bind .missing (.term pat ty) <| (withNewMutableVars vars tk.isSome tail).run ctx
   | `(doElem| let $[mut%$tk]? $pat:term ← $rhs | $els) =>
     checkLetArrowRHS rhs
     let a ← mkFreshIdent rhs
     withDoElem (← `(doElem| let $a ← $rhs)) <| .then .missing do
       withDoElem (← `(doElem| let $[mut%$tk]? $pat := $a | $els)) tail
-  | `(doElem| let $[mut%$tk]? $pat:term := $rhs | $els) => panic! "unimplemented"
+  | `(doElem| let $[mut%$tk]? $pat:term := $rhs | $els) =>
+    let vars ← getPatternVarsEx pat
+    tail.withJP fun tail => withIfLet pat rhs
+      (withDoElem rhs (withNewMutableVars vars tk.isSome tail)).run
+      (runDoSeq els tail)
   | `(doElem| $x:ident $[: $ty]? ← $rhs) => do
     let lctx ← getLCtx
     let m := (← read).mStx
     withDoElem (← `(doElem| let $x:ident $[: $ty]? ←
       (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $x)))) <|
     .then .missing <| withReassign #[x] lctx tail
-  | `(doElem| $pat:term ← $rhs) => do
+  | `(doElem| $pat:term ← $rhs $[| $els]?) =>
     let vars ← getPatternVarsEx pat
     let lctx ← getLCtx
     let m := (← read).mStx
-    withDoElem (← `(doElem| let $pat:term ←
-      (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $pat)))) <|
-    .then .missing <| withReassign vars lctx tail
-  | `(doElem| $pat:term ← $rhs | $els) => panic! "unimplemented"
+    withDoElem (← `(doElem|
+      let $pat:term ←
+        (ensure_expected_type% "invalid reassignment, value" $rhs : $m (type_of% $pat))
+        $[| $els]?)) <| .then .missing <| withReassign vars lctx tail
   | `(doElem| if%$i $cond:doIfCond then $t
       $[else if%$is $conds:doIfCond then $ts]* $[else $e?]?) =>
     tail.withJP <| withIfChain i cond t (is.zip $ conds.zip ts).toList e?
@@ -780,7 +805,7 @@ def withDoElemCore (doElem : TSyntax `doElem) (tail : Continuation) : M CodeBloc
   | `(doElem| assert! $msg) =>
     withSyntaxBinder #[] (fun rhs => `(assert! $msg; ?$rhs)) tail.run
   | `(doElem| do $elems) => runDoSeq elems tail
-  | `(doElem| $e:term) => withDoExpr e tail |>.run
+  | `(doElem| $e:term) => withDoExpr e tail
   | _ =>
     let doElem := doElem.raw
     if doElem.getKind == ``Parser.Term.doTry then
@@ -791,11 +816,11 @@ def withDoElemCore (doElem : TSyntax `doElem) (tail : Continuation) : M CodeBloc
 initialize withDoElemRef.set withDoElemCore
 
 elab "do'" seq:doSeq : term <= expectedType => do
-  let { m, returnType, .. } ← extractBind expectedType
+  let { m, expectedType } ← extractBind expectedType
   let mStx ← exprToSyntax m
   let ref ← getRef
-  let codeBlock ← runDoSeq seq (.id returnType)
-    { ref, mStx, m, returnType, expectedType := returnType }
+  let exits := RBMap.empty.insert .return
+    { ty := expectedType, jump := fun ret _ => mkAppOptM ``Pure.pure #[m, none, none, ret] }
+  let codeBlock ← runDoSeq seq (.id expectedType)
+    { ref, mStx, m, returnType := expectedType, expectedType, exits }
   pure codeBlock.code
-
-end Do
